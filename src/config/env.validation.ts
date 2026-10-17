@@ -1,10 +1,12 @@
 import { plainToInstance } from 'class-transformer';
 import {
   IsEnum,
+  IsInt,
   IsNotEmpty,
   IsOptional,
   IsPort,
   IsString,
+  Min,
   validateSync,
 } from 'class-validator';
 
@@ -62,6 +64,24 @@ class EnvironmentVariables {
   @IsString()
   @IsOptional()
   CORS_ORIGINS?: string;
+
+  @IsString()
+  @IsOptional()
+  OSRM_URL: string = 'http://localhost:5000';
+
+  @IsString()
+  @IsOptional()
+  REDIS_URL: string = 'redis://localhost:6379';
+
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  HAVERSINE_SPEED_KMH: number = 30;
+
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  LOCK_TTL_MS: number = 30000;
 }
 
 export function validate(config: Record<string, unknown>) {

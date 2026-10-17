@@ -480,3 +480,62 @@ Task: cleanup batch including deleting `vercel.json`, removing unused devDepende
 - `bunx eslint "src/**/*.ts" "test/**/*.ts"`
 - `bun run build`
 - `git status clean`
+
+## Implementation checklist: Routing Service (routing-only)
+
+Task: implement the routing-only service per `docs/SCOPE.md` — Prisma `DriverProfile`, OSRM + Haversine routing, Redis GEO driver presence, Redlock-style locks, prod compose. Stack: NestJS 11 + Prisma + ioredis. All config via env with dev defaults. No `prisma migrate`, no git push, no secrets filled.
+
+### Locked decisions
+
+| Decision                     | Choice                                                                                              |
+| ---------------------------- | --------------------------------------------------------------------------------------------------- |
+| Driver model                 | Only `DriverProfile` (+ `DriverStatus` enum) added; `user_id` is a logical reference, no FK to other services' tables |
+| OSRM timeout                 | 2000 ms via `AbortSignal.timeout()`; any failure/non-2xx/`code != "Ok"` → fallback                   |
+| Haversine fallback           | straight-line meters × `HAVERSINE_DETOUR_FACTOR` (1.35); duration = distance / `HAVERSINE_SPEED_KMH` |
+| Route source contract        | `routeSource: 'OSRM' \| 'HAVERSINE_FALLBACK'`                                                        |
+| Role guard                   | `RolesGuard` adapted to read the **`req.user.role` claim** (no per-request DB query); JWT strategy still validates the user against the DB |
+| Nearby drivers               | `GEORADIUS drivers:locations:active WITHDIST ASC COUNT`, then `EXISTS driver:heartbeat:<id>` filter   |
+| Lock primitive               | `SET lock:<key> <uuid> PX <ttl> NX` + Lua release (GET/DEL atomic via `EVAL`); not the `redlock` package |
+| /metrics and prefix          | New controllers live under `v1/...` so the global `api` prefix yields `/api/v1/...`                  |
+| Unit-test scope              | Haversine util, OSRM parsing (mocked `fetch`), routing fallback, nearby filter, locks, driver-location, roles guard |
+
+### Ordered steps (all pending)
+
+- [x] **WP1a — Prisma `DriverProfile` + `DriverStatus`**
+  Added `DriverStatus` (`OFFLINE`/`ONLINE`/`BUSY`) and `DriverProfile` (`@@map("driver_profiles")`, snake_case column maps, `userId` unique, `lastKnownLat/Lng Float?`, `updatedAt`). No other models. `bunx prisma generate` succeeded.
+  Verify: generated client exposes `DriverStatus` + `prisma.driverProfile`; `bunx tsc --noEmit` clean.
+
+- [x] **WP1b — `routing` module (`/routing/route`)**
+  `haversine.util.ts`, `osrm.client.ts` (`GET {OSRM_URL}/route/v1/driving/{lng},{lat};{lng},{lat}?overview=full&geometries=polyline`, 2 s abort), `routing.service.ts` (OSRM → Haversine ×1.35 fallback with speed-derived duration), `route-query.dto.ts`, controller `GET /api/v1/routing/route`.
+  Verify: `osrm.client.spec.ts` + `routing.service.spec.ts` cover parsing and fallback math.
+
+- [x] **WP1c — `/routing/nearby-drivers`**
+  `GET /api/v1/routing/nearby-drivers?lat&lng&radiusKm&limit` → `GEORADIUS ... WITHDIST ASC COUNT`, heartbeat-filtered, returns `[{ driverId, distanceMeters }]`. JWT-only (no `@Roles`).
+  Verify: `routing.service.spec.ts` asserts the GEORADIUS args and the heartbeat filter.
+
+- [x] **WP2a — `driver-location` module + role-claim guard**
+  `POST /api/v1/driver/location` (`@Roles('DRIVER')`) → `GEOADD` + `SET ... EX 60` + best-effort `driver_profiles` snapshot; `PATCH /api/v1/driver/status` persists status and `ZREM`s `OFFLINE` drivers. `RolesGuard` rewritten to read `req.user.role` (claims) instead of querying Prisma.
+  Verify: `driver-location.service.spec.ts` (GEO/heartbeat/snapshot, DB failure tolerance, OFFLINE ZREM) + `roles.guard.spec.ts` (claim match/mismatch/no user).
+
+- [x] **WP2b — `locks` module**
+  `POST /api/v1/locks/acquire` `{ resourceKey, ttlMs? }` → `SET lock:<key> <uuid> PX <ttl> NX` → `{ acquired, token }`; `POST /api/v1/locks/release` `{ resourceKey, token }` → Lua GET/DEL → `{ released }`. JWT guard.
+  Verify: `locks.service.spec.ts` (SET args/TTL override/contended, Lua release both branches).
+
+- [x] **WP2c — single Redis module**
+  `src/modules/redis/redis.module.ts` — `@Global()` providing a single ioredis client from `REDIS_URL` (default `redis://localhost:6379`), closed on shutdown. Health check extended with a Redis `PONG` indicator.
+  Verify: `bunx tsc --noEmit`; health wired in `health.controller.ts`.
+
+- [x] **WP3 — prod compose + docs**
+  `docker-compose.prod.yml` (app + redis + osrm, `osrm/osrm-backend`, bind-mounted `./osrm:/data`, documented extract/partition/customize prep), `.env.example` gained `OSRM_URL`/`REDIS_URL`/`HAVERSINE_SPEED_KMH`/`LOCK_TTL_MS`, README gained the endpoint contract, Redis-key table, and deploy steps.
+  Verify: `docker compose config` not run (docker out of scope); YAML inspected.
+
+- [x] **Gates**
+  `bun run lint` (0 problems), `bunx tsc --noEmit` (clean), `bun run build` (clean), `bun run test` (11 suites / 57 tests passed).
+  Infra fixes required to make `bun run test` green: removed the duplicate `jest` key from `package.json` (dual-config error) and added `roots: ['<rootDir>/src']` to `jest.config.js` so the excluded e2e spec is not discovered by the unit run.
+
+### Notes / caveats
+
+- `RolesGuard` now trusts the JWT-derived `req.user.role`. `JwtStrategy` still loads the user from the DB (`validateUserById`) so the role remains fresh; there is no longer a second per-request Prisma query.
+- The template's `RoleName` enum is `SYSTEM`/`ADMIN`/`USER`; `@Roles('DRIVER')` matches the role claim value, so issuing DRIVER tokens requires the auth side to carry that role (routing-service is decoupled from the users domain).
+- `driver_profiles` upsert `create` branches use `vehicleType`/`vehiclePlateNumber` placeholders (`'UNKNOWN'`) because those columns are `NOT NULL`; the driver snapshot mirrors live Redis GEO, which remains the source of truth.
+- ioredis was added as `ioredis@^6`. `fetch` + `AbortSignal.timeout` are used (Node 18+/Bun), no HTTP client dependency added.

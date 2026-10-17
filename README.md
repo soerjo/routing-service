@@ -23,7 +23,63 @@
 
 ## Description
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+Routing-only service: road routing (OSRM with Haversine fallback), real-time
+driver presence (Redis GEO), nearest-driver lookup, and an atomic accept-lock
+primitive. Pricing/booking live in separate services (see `docs/SCOPE.md`).
+
+## API contract
+
+All routes are under the global prefix `/api`. Every response is wrapped by the
+global interceptor as `{ statusCode, message, data, timestamp, path }`; the
+payloads below are the `data` field.
+
+| Method | Path                               | Auth   | Description                                             |
+| ------ | ---------------------------------- | ------ | ------------------------------------------------------- |
+| GET    | `/api/v1/routing/route`            | JWT    | Driving route between two points                        |
+| GET    | `/api/v1/routing/nearby-drivers`   | JWT    | Active drivers near a point, nearest first              |
+| POST   | `/api/v1/driver/location`          | DRIVER | Publish driver location + heartbeat                     |
+| PATCH  | `/api/v1/driver/status`            | DRIVER | Update driver availability (OFFLINE removes from GEO)   |
+| POST   | `/api/v1/locks/acquire`            | JWT    | Acquire `lock:<resourceKey>` (SET NX PX), returns token |
+| POST   | `/api/v1/locks/release`            | JWT    | Release the lock only if the caller still owns the token|
+
+### `GET /api/v1/routing/route`
+
+Query: `originLat`, `originLng`, `destLat`, `destLng` (numbers).
+Returns `{ distanceMeters, durationSeconds, polyline, routeSource }` where
+`routeSource` is `OSRM` or `HAVERSINE_FALLBACK` (Haversine × 1.35, duration
+derived from `HAVERSINE_SPEED_KMH`).
+
+### `GET /api/v1/routing/nearby-drivers`
+
+Query: `lat`, `lng`, `radiusKm` (default 5), `limit` (default 10, max 50).
+Returns an ordered array `[{ driverId, distanceMeters }]` filtered by a live
+`driver:heartbeat:<id>` key.
+
+### `POST /api/v1/driver/location`
+
+Body: `{ lat, lng }`. Writes `GEOADD drivers:locations:active` and
+`SET driver:heartbeat:<id> "1" EX 60`; mirrors a best-effort `lastKnownLat/Lng`
+snapshot into `driver_profiles`. The driver id comes from the JWT subject.
+
+### `PATCH /api/v1/driver/status`
+
+Body: `{ status }` where status is `OFFLINE`, `ONLINE`, or `BUSY`. Persists to
+`driver_profiles`; `OFFLINE` also removes the driver from the GEO index.
+
+### `POST /api/v1/locks/acquire` and `POST /api/v1/locks/release`
+
+Acquire body: `{ resourceKey, ttlMs? }` (TTL defaults to `LOCK_TTL_MS`).
+Returns `{ acquired, token }`. Release body: `{ resourceKey, token }`; the
+release Lua script deletes the key only when the stored value still equals the
+token. Returns `{ released }`.
+
+## Redis keys
+
+| Key                                  | Contents                          | TTL        |
+| ------------------------------------ | --------------------------------- | ---------- |
+| `drivers:locations:active` (GEO)     | member = driver id, geohash score | —          |
+| `driver:heartbeat:<driver_id>`       | `"1"`                             | 60 seconds |
+| `lock:<resource_key>`                | lock token                        | per acquire|
 
 ## Project setup
 
@@ -75,6 +131,24 @@ Create a `.env` file (see `.env.example`) before running the app. Key variables:
 | `GOOGLE_CALLBACK_URL`    | No       | see `.env.example` | Google OAuth callback URL                                                    |
 | `FRONTEND_URL`           | No       | `http://localhost:5173` | Frontend base URL (Google OAuth redirect)                                |
 | `CORS_ORIGINS`           | No       | —             | Comma-separated allowed origins; unset/empty enables CORS for all origins (dev)   |
+| `OSRM_URL`               | No       | `http://localhost:5000` | OSRM backend base URL                                       |
+| `REDIS_URL`              | No       | `redis://localhost:6379` | Redis connection string (GEO index + locks)                |
+| `HAVERSINE_SPEED_KMH`    | No       | `30`          | Average speed used to estimate fallback route duration                    |
+| `LOCK_TTL_MS`            | No       | `30000`       | Default lock TTL for `POST /api/v1/locks/acquire`                         |
+
+### Deploying the production stack
+
+`docker-compose.prod.yml` runs the app, Redis, and OSRM as one stack. OSRM needs
+a preprocessed regional map extract (Jabodetabek/Indonesia) placed in `./osrm`
+— the compose file documents the `osrm-extract` / `osrm-partition` /
+`osrm-customize` commands. Create `.env` from `.env.example` (fill in
+`DATABASE_URL` and the JWT secrets), then:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+Redis and OSRM stay on the internal network; only the app port is published.
 
 ## Deployment
 

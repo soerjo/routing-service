@@ -1,0 +1,79 @@
+# Routing Service — production stack (app + redis + osrm).
+#
+# Single-service mindset: the app owns routing computation and the driver
+# presence index; there is no pricing/booking database here.
+#
+# OSRM needs a preprocessed map extract for the target region. Prepare it
+# once on the host (or in a one-off container) before starting the stack:
+#
+#   wget https://download.geofabrik.de/asia/indonesia-latest.osm.pbf -O osrm/osm.pbf
+#   docker run --rm -v "$PWD/osrm:/data" osrm/osrm-backend \
+#     osrm-extract -p /opt/car.lua /data/osm.pbf
+#   docker run --rm -v "$PWD/osrm:/data" osrm/osrm-backend \
+#     osrm-partition /data/osm.osrm
+#   docker run --rm -v "$PWD/osrm:/data" osrm/osrm-backend \
+#     osrm-customize /data/osm.osrm
+#
+# Then create `.env` from `.env.example` and run:
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: routing-service-app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      REDIS_URL: redis://redis:6379
+      OSRM_URL: http://osrm:5000
+      HAVERSINE_SPEED_KMH: ${HAVERSINE_SPEED_KMH:-30}
+      LOCK_TTL_MS: ${LOCK_TTL_MS:-30000}
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      redis:
+        condition: service_healthy
+      osrm:
+        condition: service_started
+    networks:
+      - routing-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: routing-service-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - routing-network
+
+  osrm:
+    image: osrm/osrm-backend
+    container_name: routing-service-osrm
+    restart: unless-stopped
+    command: osrm-routed --algorithm mld /data/osm.osrm
+    volumes:
+      - ./osrm:/data
+    networks:
+      - routing-network
+
+networks:
+  routing-network:
+    driver: bridge
+
+volumes:
+  redis_data:
